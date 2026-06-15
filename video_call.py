@@ -759,6 +759,9 @@ async def _voice_chat_monitor_loop() -> None:
     # Warmup: isi _call_id_to_chat dari grup Security OS yang sudah punya VC aktif
     await _warmup_active_calls()
 
+    # Auto-join VC aktif saat startup/redeploy (aman dari FloodWait)
+    asyncio.create_task(_auto_join_active_voice_chats())
+
     # Jaga task tetap hidup
     while _ub_ready and userbot:
         await asyncio.sleep(30)
@@ -851,6 +854,101 @@ async def _warmup_active_calls() -> None:
         except Exception:
             pass
         await asyncio.sleep(2)
+
+
+# ── Jeda antar join VC saat startup (cegah FloodWait) ────────────────────────
+_VC_JOIN_STARTUP_STAGGER = 5.0   # detik jeda antar join VC per grup
+
+
+async def _auto_join_active_voice_chats() -> None:
+    """
+    Saat startup/redeploy, userbot otomatis join ke semua obrolan suara
+    yang sedang aktif di grup-grup yang Security OS-nya enabled.
+
+    ── KENAPA PERLU JOIN VC ────────────────────────────────────────────────
+    Meskipun UpdateGroupCallParticipants diterima tanpa join VC,
+    phone.EditGroupCallParticipant (mute mic) HANYA bisa dipanggil oleh
+    peserta aktif VC ATAU admin dengan izin 'Kelola Obrolan Video'.
+    Jika userbot adalah admin dengan izin tersebut, join VC tidak wajib —
+    tapi jika gagal mute (error GROUP_CALL_NOT_MODIFIED atau serupa),
+    join VC sebagai fallback memastikan mute tetap berhasil.
+
+    ── KEAMANAN FLOODWAIT ──────────────────────────────────────────────────
+    • Join dilakukan satu per satu dengan jeda _VC_JOIN_STARTUP_STAGGER detik.
+    • FloodWait ditangkap dan ditunggu sebelum lanjut ke grup berikutnya.
+    • Userbot join sebagai muted (tidak bicara) agar tidak mengganggu VC.
+
+    ── KAPAN DIPANGGIL ─────────────────────────────────────────────────────
+    Dipanggil dari start_userbot() SETELAH _warmup_active_calls() selesai,
+    sehingga _call_id_to_chat sudah terisi dan join bisa langsung terjadi.
+    """
+    if not userbot:
+        return
+    db, _, _ = _get_db()
+    try:
+        docs = await db["security_os"].find({"enabled": True}).to_list(None)
+    except Exception:
+        return
+
+    if not docs:
+        return
+
+    from pyrogram.raw import functions as _rf
+    from pyrogram.raw.types import InputGroupCall, DataJSON
+
+    joined_count = 0
+    for doc in docs:
+        chat_id = doc.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            chat_peer = await userbot.resolve_peer(chat_id)
+            full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
+            call_obj = getattr(full.full_chat, "call", None)
+            if not call_obj:
+                continue  # Tidak ada VC aktif di grup ini
+
+            call_id   = call_obj.id
+            ah        = getattr(call_obj, "access_hash", None)
+            if not ah:
+                print(f"[UB-VC-Join] Grup {chat_id}: access_hash tidak tersedia — skip join")
+                continue
+
+            input_call = InputGroupCall(id=call_id, access_hash=ah)
+
+            # Join VC sebagai muted — userbot hadir tapi tidak bicara
+            import json, random
+            params = DataJSON(data=json.dumps({"ufrag": "ub", "pwd": "ub", "fingerprints": [], "ssrc": 0}))
+            await userbot.invoke(
+                _rf.phone.JoinGroupCall(
+                    call=input_call,
+                    join_as=await userbot.resolve_peer("me"),
+                    params=params,
+                    muted=True,
+                    video_stopped=True,
+                )
+            )
+            joined_count += 1
+            print(f"[UB-VC-Join] ✅ Userbot join VC grup {chat_id} (call_id={call_id}) sebagai muted")
+
+        except FloodWait as fw:
+            print(f"[UB-VC-Join] FloodWait {fw.value}s saat join VC grup {chat_id} — menunggu...")
+            await asyncio.sleep(fw.value + 1)
+        except Exception as e:
+            # Bisa gagal jika: VC sudah penuh, userbot sudah join, atau VC berakhir
+            err_str = str(e)
+            if "already" in err_str.lower() or "ALREADY" in err_str:
+                print(f"[UB-VC-Join] Grup {chat_id}: userbot sudah ada di VC")
+            else:
+                print(f"[UB-VC-Join] Grup {chat_id}: gagal join VC — {e} (tidak fatal)")
+
+        if joined_count > 0 or True:
+            await asyncio.sleep(_VC_JOIN_STARTUP_STAGGER)
+
+    if joined_count > 0:
+        print(f"[UB-VC-Join] ✅ Selesai — userbot join {joined_count} VC aktif saat startup.")
+    else:
+        print("[UB-VC-Join] Tidak ada VC aktif yang perlu di-join saat startup.")
 
 
 def _build_input_group_call(call_id: int):
@@ -1022,25 +1120,21 @@ async def _execute_kick(chat_id: int, user_id: int, call_input) -> None:
 
 async def _kick_from_voice(chat_id: int, user_id: int, call_input) -> None:
     """
-    Turunkan user dari obrolan suara/video call menggunakan raw API Telegram.
+    Mute mic user di obrolan suara menggunakan raw API Telegram.
 
-    ── ALUR PENURUNAN USER DENGAN BIO-LINK ─────────────────────────────────
-    Fungsi ini dipanggil oleh _execute_kick() setelah _query_monitor_then_kick()
-    mengkonfirmasi bahwa user memiliki link di bio (has_link=True dari DB).
+    ── CATATAN PERUBAHAN ────────────────────────────────────────────────────
+    Telegram tidak lagi mengizinkan kick paksa dari VC oleh admin/userbot
+    (error: VIDEO_STOP_FORBIDDEN). Sebagai gantinya, userbot akan mute mic
+    user saja (muted=True) — user masih di VC tapi tidak bisa berbicara.
 
     Metode API: phone.EditGroupCallParticipant (MTProto)
-      • Ini adalah endpoint resmi Telegram untuk memodifikasi peserta VC.
-      • Parameter yang diset: muted=True, volume=0, video_stopped=True,
-        video_paused=True, presentation_paused=True.
-      • Efek: user di-mute dan video/screen-share-nya dihentikan paksa,
-        sehingga user secara efektif "diturunkan" dari obrolan suara.
-      • Userbot harus punya izin "Kelola Obrolan Video" (manage_video_chats)
-        di grup agar API call ini berhasil.
-      • Userbot TIDAK perlu berada di dalam VC — cukup jadi admin grup
-        dengan izin tersebut.
+      • Parameter yang diset: muted=True SAJA.
+      • Efek: mic user di-mute paksa — user tidak bisa berbicara di VC.
+      • Userbot harus punya izin "Kelola Obrolan Video" (manage_video_chats).
+      • Userbot TIDAK perlu berada di dalam VC.
 
-    Setelah penurunan berhasil, _execute_kick() mengantrekan notifikasi
-    teks ke grup via _enqueue_warning() dengan jeda antar pesan.
+    Setelah mute berhasil, _execute_kick() mengantrekan notifikasi teks
+    ke grup via _enqueue_warning() dengan jeda antar pesan.
     """
     if not userbot:
         return
@@ -1052,16 +1146,11 @@ async def _kick_from_voice(chat_id: int, user_id: int, call_input) -> None:
                 call=call_input,
                 participant=peer,
                 muted=True,
-                volume=0,
-                raise_hand=False,
-                video_stopped=True,
-                video_paused=True,
-                presentation_paused=True,
             )
         )
-        print(f"[UB-VC] ✅ User {user_id} diturunkan dari voice chat grup {chat_id}")
+        print(f"[UB-VC] ✅ Mic user {user_id} di-mute di voice chat grup {chat_id}")
     except FloodWait as fw:
-        print(f"[UB-VC] FloodWait {fw.value}s saat kick uid={user_id} — menunggu & retry...")
+        print(f"[UB-VC] FloodWait {fw.value}s saat mute mic uid={user_id} — menunggu & retry...")
         await asyncio.sleep(fw.value + 1)
         # Coba sekali lagi setelah FloodWait
         try:
@@ -1072,18 +1161,13 @@ async def _kick_from_voice(chat_id: int, user_id: int, call_input) -> None:
                     call=call_input,
                     participant=peer2,
                     muted=True,
-                    volume=0,
-                    raise_hand=False,
-                    video_stopped=True,
-                    video_paused=True,
-                    presentation_paused=True,
                 )
             )
-            print(f"[UB-VC] ✅ Retry kick uid={user_id} di grup {chat_id} berhasil")
+            print(f"[UB-VC] ✅ Retry mute mic uid={user_id} di grup {chat_id} berhasil")
         except Exception as e2:
-            print(f"[UB-VC] Retry kick uid={user_id} gagal: {e2}")
+            print(f"[UB-VC] Retry mute mic uid={user_id} gagal: {e2}")
     except Exception as e:
-        print(f"[UB-VC] Gagal kick uid={user_id} dari voice chat: {e}")
+        print(f"[UB-VC] Gagal mute mic uid={user_id} dari voice chat: {e}")
 
 
 async def _do_send_warning(chat_id: int, user_id: int) -> None:
@@ -1111,9 +1195,9 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
 
         # Kirim peringatan di grup via bot biasa — tangani FloodWait
         warn_msg = (
-            f"🔇 {mention} diturunkan dari obrolan suara.\n"
-            f"<i>Hapus link/privatkan bio Anda untuk dapat "
-            f"naik kembali ke obrolan suara.</i>"
+            f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
+            f"<i>Bio Anda mengandung link/username. "
+            f"Hapus link atau privatkan bio agar mic dapat diaktifkan kembali.</i>"
         )
         sent_warn = None
         try:
@@ -1139,8 +1223,8 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
         # Catat ke log aktivitas grup (fungsi asli database.py)
         await insert_group_action_log(
             chat_id,
-            "KICK-VC",
-            "Security OS: link di bio, dikeluarkan dari voice chat",
+            "MUTE-VC-MIC",
+            "Security OS: link di bio, mic di-mute di voice chat",
             user_id,
             name[:50],
         )
