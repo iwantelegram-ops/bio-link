@@ -679,7 +679,15 @@ async def _voice_chat_monitor_loop() -> None:
         call_id = update.call.id
         chat_id = _call_id_to_chat.get(call_id)
         if not chat_id:
-            return
+            # ── FALLBACK: mapping belum terisi (warmup gagal/terlewat) ───────
+            # Coba resolve langsung dengan cocokkan call.id ke grup Security OS
+            # yang terdaftar. Hasil yang cocok di-cache agar event berikutnya
+            # tidak perlu resolve ulang.
+            chat_id = await _resolve_chat_for_call_id(call_id)
+            if not chat_id:
+                return
+            _call_id_to_chat[call_id] = chat_id
+            print(f"[UB-VC] Fallback resolve: call_id={call_id} → grup {chat_id}")
 
         sec_doc = await _sec_os_get(chat_id)
         if not sec_doc.get("enabled"):
@@ -736,6 +744,47 @@ async def _voice_chat_monitor_loop() -> None:
 
 
 _MAX_PARALLEL_GROUP_SCANS = 3  # dipertahankan untuk kompatibilitas
+
+
+async def _resolve_chat_for_call_id(call_id: int) -> int | None:
+    """
+    Fallback saat _call_id_to_chat tidak punya entri untuk call_id ini
+    (warmup gagal/terlewat, atau VC dimulai sebelum warmup selesai).
+
+    Iterasi grup Security OS aktif, GetFullChannel tiap grup, cocokkan
+    call.id dengan call_id yang sedang diproses. Sekali ketemu langsung
+    return — hasil di-cache oleh caller ke _call_id_to_chat.
+
+    Tidak dipanggil sering: hanya saat terjadi cache-miss pada
+    _call_id_to_chat, jadi aman dari segi rate limit (di-throttle
+    dengan sleep kecil + FloodWait handling).
+    """
+    if not userbot:
+        return None
+    db, _, _ = _get_db()
+    try:
+        docs = await db["security_os"].find({"enabled": True}).to_list(None)
+    except Exception:
+        return None
+
+    from pyrogram.raw import functions as _rf
+    for doc in docs:
+        chat_id = doc.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            chat_peer = await userbot.resolve_peer(chat_id)
+            full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
+            call_obj = getattr(full.full_chat, "call", None)
+            if call_obj and call_obj.id == call_id:
+                return chat_id
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value + 1)
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    return None
 
 
 async def _warmup_active_calls() -> None:

@@ -328,6 +328,15 @@ class MonitorInstance:
         chat_id = self.chat_id
         monitor = self
 
+        # ── User KIRIM PESAN di grup → cek bio (throttle BIO_RECHECK_SECS) ────
+        @self.client.on_message(filters.chat(chat_id) & filters.group)
+        async def _on_message(client: Client, message: Message):
+            user = message.from_user
+            if user is None or user.is_bot:
+                return
+            # force=False → otomatis skip jika sudah dicek < BIO_RECHECK_SECS
+            await monitor.check_and_save(user.id, force=False)
+
         # ── User JOIN grup → langsung cek bio ────────────────────────────────
         @self.client.on_chat_member_updated()
         async def _on_join(client: Client, upd: ChatMemberUpdated):
