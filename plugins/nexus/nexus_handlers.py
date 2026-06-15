@@ -13,8 +13,10 @@ STRUKTUR MENU:
   [Sub-menu OWNER BOT]
   ┌─ 📊 RECORD DATA     │  📂 GRUP TERDAFTAR
   ├─ ⚡ PAKSA REKALKULASI │ 🔄 REFRESH METRIK
-  ├─ 🧠 LIHAT AI
-  └─ 🗑️ RESET INTEGRASI │  🔙 KEMBALI
+  ├─ 🧠 LIHAT AI        │  📋 LOG AKTIVITAS
+  ├─ 🔬 DEBUG AI (24j)  │  🗑️ RESET INTEGRASI
+  ├─ 📱 GANTI USERBOT
+  └─ 🔙 KEMBALI KE NEXUS
 
   [Sub-menu GLOBAL REGEX]
   ┌─ 🧬 VISUALISASI FILTER
@@ -914,9 +916,67 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
                     InlineKeyboardButton("🔬  Debug AI (24j)",  callback_data="nx_ai_debug_page_1"),
                     InlineKeyboardButton("🗑️  Reset Integrasi", callback_data="nx_menu_reset"),
                 ],
+                [InlineKeyboardButton("📱  Ganti Userbot",       callback_data="nx_setuserbot")],
                 [InlineKeyboardButton("🔙  Kembali ke Nexus",   callback_data="nx_home")],
             ])
         )
+
+    elif data == "nx_setuserbot":
+        if user_id != OWNER_ID:
+            try:
+                await cq.answer(
+                    "🔒 Fitur ini hanya untuk Owner bot.",
+                    show_alert=True
+                )
+            except Exception:
+                pass
+            return
+        try:
+            await cq.answer()
+        except Exception:
+            pass
+        # Import FSM setuserbot dari handlers_secos dan mulai dengan chat_id=0
+        # chat_id=0 → konteks owner panel (bukan per-grup)
+        from plugins.ui.handlers_secos import (
+            _pending_setuserbot, _cancel_setuserbot_task,
+            _setuserbot_timeout, WAIT_TIMEOUT_UB,
+        )
+        from plugins.ui.handlers_dm import safe_edit
+        _cancel_setuserbot_task(user_id)
+        _pending_setuserbot[user_id] = {
+            "chat_id": 0,       # 0 = konteks owner, bukan per-grup
+            "msg_id":  cq.message.id,
+            "_task":   None,
+        }
+        await safe_edit(
+            cq.message,
+            "📱 <b>GANTI USERBOT</b>\n"
+            "<i>Diakses dari Owner Bot Panel</i>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Kirim <b>nomor HP</b> akun userbot baru ke sini.\n\n"
+            "<b>📋 LANGKAH-LANGKAH:</b>\n\n"
+            "<b>1️⃣ Siapkan akun Telegram</b>\n"
+            "   Gunakan akun biasa (bukan bot) yang akan dijadikan userbot.\n\n"
+            "<b>2️⃣ Kirim nomor HP ke sini</b>\n"
+            "   Format internasional: <code>+628123456789</code>\n\n"
+            "<b>3️⃣ Masukkan OTP</b>\n"
+            "   Telegram akan mengirim kode OTP ke nomor tersebut.\n"
+            "   Kirim kode via DM bot dengan format: <code>/otp &lt;kode&gt;</code>\n\n"
+            "<b>4️⃣ Adminkan userbot ke grup</b>\n"
+            "   Setelah login berhasil, jadikan userbot admin dengan izin\n"
+            "   <code>Kelola Obrolan Video</code> di setiap grup Security OS.\n\n"
+            "⚠️ <b>Userbot lama akan diputus dan session-nya dihapus.</b>\n\n"
+            f"<i>⏳ Batas waktu input: {WAIT_TIMEOUT_UB // 60} menit.</i>\n"
+            "<i>Kirim /batal untuk membatalkan.</i>",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫  Batalkan", callback_data="nx_owner_menu")]
+            ])
+        )
+        task = asyncio.create_task(
+            _setuserbot_timeout(user_id, 0, cq.message, cq._client)
+        )
+        if user_id in _pending_setuserbot:
+            _pending_setuserbot[user_id]["_task"] = task
 
     elif data == "nx_list_grup":
         if user_id != OWNER_ID:
