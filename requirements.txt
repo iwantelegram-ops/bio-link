@@ -1,0 +1,13 @@
+pyrogram==2.0.106
+TgCrypto
+aiosqlite
+python-dotenv
+httpx
+rapidfuzz
+pytz
+dnspython
+
+# ── Opsional: aktifkan jika pakai MongoDB ─────────────────────────────────────
+# Hapus tanda # di bawah jika MONGO_URL diisi di .env
+# motor==3.3.2
+# pymongo==4.6.1
