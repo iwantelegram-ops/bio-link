@@ -816,12 +816,6 @@ async def page_security_os(chat_id: int, client=None):
         InlineKeyboardButton(label_mon, callback_data=f"secos_setmon_{chat_id}")
     ])
 
-    # Tombol ganti userbot (selalu tampil, di bawah ganti bot pemantau)
-    ub_label = "🔄  Ganti Userbot" if ub_ready else "📱  Ganti / Pasang Userbot"
-    buttons.append([
-        InlineKeyboardButton(ub_label, callback_data=f"secos_setuserbot_{chat_id}")
-    ])
-
     # Tombol aktifkan / nonaktifkan
     if enabled:
         buttons.append([

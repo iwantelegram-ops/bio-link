@@ -449,8 +449,16 @@ async def _setuserbot_timeout(user_id: int, chat_id: int, msg, client: Client):
         return
     _pending_setuserbot.pop(user_id, None)
     try:
-        text, keyboard = await page_security_os(chat_id, client)
-        await safe_edit(msg, "⏰ <b>Timeout.</b> Input nomor dibatalkan.\n\n" + text, keyboard)
+        if chat_id == 0:
+            # Dipanggil dari owner panel — kembali ke nx_owner_menu
+            await safe_edit(
+                msg,
+                "⏰ <b>Timeout.</b> Input nomor dibatalkan.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Owner Bot Panel", callback_data="nx_owner_menu")]])
+            )
+        else:
+            text, keyboard = await page_security_os(chat_id, client)
+            await safe_edit(msg, "⏰ <b>Timeout.</b> Input nomor dibatalkan.\n\n" + text, keyboard)
     except Exception:
         pass
 
@@ -485,14 +493,24 @@ async def handle_setuserbot_input(client: Client, message: Message):
     if text.lower() in ("/batal", "/cancel"):
         _cancel_setuserbot_task(user_id)
         try:
-            page_text, keyboard = await page_security_os(chat_id, client)
-            await client.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=msg_id,
-                text="✅ <b>Dibatalkan.</b>\n\n" + page_text,
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML,
-            )
+            if chat_id == 0:
+                # Dipanggil dari owner panel
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=msg_id,
+                    text="✅ <b>Dibatalkan.</b>",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Owner Bot Panel", callback_data="nx_owner_menu")]]),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                page_text, keyboard = await page_security_os(chat_id, client)
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=msg_id,
+                    text="✅ <b>Dibatalkan.</b>\n\n" + page_text,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML,
+                )
         except Exception:
             pass
         try:
@@ -545,22 +563,37 @@ async def handle_setuserbot_input(client: Client, message: Message):
     from video_call import change_userbot
     ok, result_msg = await change_userbot(text, client)
 
-    page_text, keyboard = await page_security_os(chat_id, client)
-
-    if ok:
-        final_text = (
-            f"{result_msg}\n\n"
-            f"⚠️ <b>Langkah selanjutnya:</b>\n"
-            f"1️⃣ Pastikan userbot sudah jadi admin di setiap grup Security OS\n"
-            f"   dengan izin <code>Kelola Obrolan Video</code>.\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n{page_text}"
-        )
+    if chat_id == 0:
+        # Dipanggil dari owner panel — tidak ada page_security_os, redirect ke owner menu
+        if ok:
+            final_text = (
+                f"{result_msg}\n\n"
+                f"⚠️ <b>Langkah selanjutnya:</b>\n"
+                f"1️⃣ Pastikan userbot sudah jadi admin di setiap grup Security OS\n"
+                f"   dengan izin <code>Kelola Obrolan Video</code>."
+            )
+        else:
+            final_text = (
+                f"❌ <b>Gagal mengganti userbot.</b>\n"
+                f"{result_msg}"
+            )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Owner Bot Panel", callback_data="nx_owner_menu")]])
     else:
-        final_text = (
-            f"❌ <b>Gagal mengganti userbot.</b>\n"
-            f"{result_msg}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n{page_text}"
-        )
+        page_text, keyboard = await page_security_os(chat_id, client)
+        if ok:
+            final_text = (
+                f"{result_msg}\n\n"
+                f"⚠️ <b>Langkah selanjutnya:</b>\n"
+                f"1️⃣ Pastikan userbot sudah jadi admin di setiap grup Security OS\n"
+                f"   dengan izin <code>Kelola Obrolan Video</code>.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n{page_text}"
+            )
+        else:
+            final_text = (
+                f"❌ <b>Gagal mengganti userbot.</b>\n"
+                f"{result_msg}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n{page_text}"
+            )
 
     try:
         await client.edit_message_text(
