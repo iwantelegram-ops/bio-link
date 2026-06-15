@@ -1,0 +1,1 @@
+{"version":"2.0","saved_at":"","bayes":{"alpha":1.0,"class_count":{"spam":0,"ham":0},"feat_spam":{},"feat_ham":{},"vocab":[]},"adaptive":{"threshold":0.55,"spam_scores":[],"ham_scores":[],"update_count":0},"stats":{"total_checked":0,"total_spam":0,"total_ham":0,"learn_count":0,"last_updated":""}}
