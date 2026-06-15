@@ -98,6 +98,13 @@ _pending_checks: dict[tuple[int, int], int] = {}
 # Dideklarasikan di sini (global) agar _on_vc_update bisa mengaksesnya.
 _call_id_to_chat: dict[int, int] = {}
 
+# ── Mapping call_id → access_hash (wajib untuk InputGroupCall di raw API) ────
+# update.call di UpdateGroupCallParticipants hanya berisi .id (GroupCallReference),
+# TIDAK mengandung access_hash. access_hash hanya ada di UpdateGroupCall (saat VC
+# dimulai) dan di GetFullChannel. Kita simpan di sini agar bisa build InputGroupCall
+# yang valid saat memanggil phone.EditGroupCallParticipant.
+_call_id_to_access_hash: dict[int, int] = {}
+
 # ── Global semaphore — batasi concurrent /checkbio ke seluruh Telegram API ───
 # Maks 3 query paralel di seluruh sistem (lintas semua grup).
 # Diinisialisasi lazy di start_userbot().
@@ -656,7 +663,7 @@ async def _voice_chat_monitor_loop() -> None:
         except ImportError:
             return
 
-        # ── Tangkap voice chat baru dimulai → daftarkan call_id ──────────────
+        # ── Tangkap voice chat baru dimulai → daftarkan call_id + access_hash ─
         if isinstance(update, UpdateGroupCall):
             chat_id_raw = getattr(update, "chat_id", None)
             if chat_id_raw:
@@ -665,12 +672,22 @@ async def _voice_chat_monitor_loop() -> None:
                 call_obj = getattr(update, "call", None)
                 if call_obj:
                     call_id = getattr(call_obj, "id", None)
+                    # BUG FIX: simpan access_hash — hanya tersedia di UpdateGroupCall,
+                    # TIDAK ada di UpdateGroupCallParticipants (GroupCallReference).
+                    # Tanpa access_hash, phone.EditGroupCallParticipant akan gagal
+                    # dengan ACCESS_HASH_INVALID atau serupa.
+                    access_hash = getattr(call_obj, "access_hash", None)
                     if call_id:
                         # Cek apakah grup ini Security OS aktif
                         sec = await _sec_os_get(chat_id_neg)
                         if sec.get("enabled") and sec.get("monitor_bot_id"):
                             _call_id_to_chat[call_id] = chat_id_neg
-                            print(f"[UB-VC] Voice chat dimulai di grup {chat_id_neg} (call_id={call_id})")
+                            if access_hash is not None:
+                                _call_id_to_access_hash[call_id] = access_hash
+                            print(
+                                f"[UB-VC] Voice chat dimulai di grup {chat_id_neg} "
+                                f"(call_id={call_id}, access_hash={'✅' if access_hash else '⚠️ tidak ada'})"
+                            )
             return
 
         if not isinstance(update, UpdateGroupCallParticipants):
@@ -723,15 +740,20 @@ async def _voice_chat_monitor_loop() -> None:
                 if time.monotonic() - cache_ts < _BIO_CACHE_TTL:
                     if has_link:
                         _processing_kick.add(key)
+                        # BUG FIX: Bangun InputGroupCall dengan access_hash yang valid.
+                        # update.call adalah GroupCallReference (hanya punya .id),
+                        # phone.EditGroupCallParticipant butuh InputGroupCall (.id + .access_hash).
+                        call_input = _build_input_group_call(call_id)
                         asyncio.create_task(
-                            _execute_kick(chat_id, uid, update.call)
+                            _execute_kick(chat_id, uid, call_input)
                         )
                     continue
 
             # Query DB (bot pemantau sudah mengisi bio_profiles)
             _processing_kick.add(key)
+            call_input = _build_input_group_call(call_id)
             asyncio.create_task(
-                _query_monitor_then_kick(chat_id, uid, monitor_id, update.call)
+                _query_monitor_then_kick(chat_id, uid, monitor_id, call_input)
             )
 
     # Warmup: isi _call_id_to_chat dari grup Security OS yang sudah punya VC aktif
@@ -777,6 +799,10 @@ async def _resolve_chat_for_call_id(call_id: int) -> int | None:
             full = await userbot.invoke(_rf.channels.GetFullChannel(channel=chat_peer))
             call_obj = getattr(full.full_chat, "call", None)
             if call_obj and call_obj.id == call_id:
+                # BUG FIX: simpan access_hash dari fallback resolve juga
+                access_hash = getattr(call_obj, "access_hash", None)
+                if access_hash is not None:
+                    _call_id_to_access_hash[call_id] = access_hash
                 return chat_id
         except FloodWait as fw:
             await asyncio.sleep(fw.value + 1)
@@ -811,12 +837,43 @@ async def _warmup_active_calls() -> None:
             call_obj = getattr(full.full_chat, "call", None)
             if call_obj:
                 _call_id_to_chat[call_obj.id] = chat_id
-                print(f"[UB-VC] Warmup: grup {chat_id} punya voice chat aktif (call_id={call_obj.id})")
+                # BUG FIX: simpan access_hash dari GetFullChannel — ini sumber
+                # access_hash yang valid untuk InputGroupCall saat warmup.
+                access_hash = getattr(call_obj, "access_hash", None)
+                if access_hash is not None:
+                    _call_id_to_access_hash[call_obj.id] = access_hash
+                print(
+                    f"[UB-VC] Warmup: grup {chat_id} punya voice chat aktif "
+                    f"(call_id={call_obj.id}, access_hash={'✅' if access_hash else '⚠️ tidak ada'})"
+                )
         except FloodWait as fw:
             await asyncio.sleep(fw.value + 1)
         except Exception:
             pass
         await asyncio.sleep(2)
+
+
+def _build_input_group_call(call_id: int):
+    """
+    Bangun InputGroupCall yang valid untuk raw API phone.EditGroupCallParticipant.
+
+    UpdateGroupCallParticipants hanya membawa GroupCallReference (.id saja).
+    phone.EditGroupCallParticipant WAJIB menerima InputGroupCall (.id + .access_hash).
+    Tanpa access_hash yang benar, Telegram mengembalikan ACCESS_HASH_INVALID.
+
+    access_hash di-cache dari UpdateGroupCall (saat VC mulai) dan dari
+    GetFullChannel (saat warmup). Jika tidak ditemukan (cache miss), gunakan 0
+    sebagai fallback — beberapa implementasi Pyrogram versi lama toleran terhadap
+    ini, tapi idealnya selalu tersedia dari cache.
+    """
+    from pyrogram.raw.types import InputGroupCall
+    access_hash = _call_id_to_access_hash.get(call_id, 0)
+    if not access_hash:
+        print(
+            f"[UB-VC] ⚠️  access_hash untuk call_id={call_id} tidak ditemukan di cache. "
+            "Pastikan UpdateGroupCall (VC start) diterima sebelum UpdateGroupCallParticipants."
+        )
+    return InputGroupCall(id=call_id, access_hash=access_hash)
 
 
 async def _scan_active_groups() -> None:
@@ -864,11 +921,12 @@ async def _query_monitor_then_kick(
     try:
         has_link = await _query_bio_from_db(chat_id, user_id)
 
-        # Simpan ke in-memory cache agar event VC berikutnya lebih cepat
-        _bio_cache[(chat_id, user_id)] = (
-            has_link if has_link is not None else False,
-            time.monotonic()
-        )
+        # BUG FIX: Hanya cache hasil yang definitif (True/False).
+        # Jika has_link is None berarti bot pemantau belum scan user ini —
+        # JANGAN cache sebagai False, nanti user yang seharusnya di-kick
+        # akan lolos selama 10 menit karena cache miss terus dianggap "aman".
+        if has_link is not None:
+            _bio_cache[(chat_id, user_id)] = (has_link, time.monotonic())
 
         if has_link:
             await _execute_kick(chat_id, user_id, call_input)
