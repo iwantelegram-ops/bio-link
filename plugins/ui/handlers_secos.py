@@ -182,12 +182,12 @@ async def cb_secos_setmon(client: Client, cb: CallbackQuery):
         ])
 
     ub_admin_text = (
-        f"\n\n<b>4️⃣ Adminkan Userbot ke Grup</b>\n"
+        f"\n\n<b>4️⃣ Adminkan Userbot ke Grup. ( tidak wajib jika hanya untuk menyalakan bio cek di typingan grup )</b>\n"
         f"   Tekan tombol di bawah untuk memberi hak admin ke "
         f"<b>@{ub_uname}</b> (userbot) di grup ini.\n"
         f"   Izin minimal: <code>Kelola Obrolan Video</code>."
         if ub_uname else
-        f"\n\n<b>4️⃣ Adminkan Userbot ke Grup</b>\n"
+        f"\n\n<b>4️⃣ Adminkan Userbot ke Grup. ( tidak wajib jika hanya untuk menyalakan bio cek di typingan grup )</b>\n"
         f"   Setelah bot pemantau terpasang, cari userbot di daftar member grup\n"
         f"   dan jadikan admin dengan izin <code>Kelola Obrolan Video</code>."
     )
@@ -204,9 +204,9 @@ async def cb_secos_setmon(client: Client, cb: CallbackQuery):
         f"<b>2️⃣ Kirim token ke sini</b>\n"
         f"   Token berbentuk: <code>123456789:ABCdef...</code>\n"
         f"   Bot pemantau akan otomatis di-deploy & dipasang ke grup ini.\n\n"
-        f"<b>3️⃣ Jadikan Bot Pemantau Admin Grup</b>\n"
-        f"   Setelah terpasang, tambahkan bot pemantau sebagai <b>admin</b>\n"
-        f"   di grup agar bisa memeriksa bio member dengan akurat."
+        f"<b>3️⃣ Jadikan Bot Pemantau Member Grup</b>\n"
+        f"   Bot Otomatis Bekerja, Atau Tambahkan sebagai <b>admin</b>\n"
+        f"   di grup agar lebih akurat (opsional)."
         f"{ub_admin_text}\n\n"
         f"◈ 1 bot pemantau hanya boleh dipakai di <b>1 grup</b>.\n"
         f"◈ Token bot lama otomatis digantikan jika kamu memasukkan token baru.\n\n"
