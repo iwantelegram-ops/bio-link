@@ -7,7 +7,31 @@ rapidfuzz
 pytz
 dnspython
 
-# ── Opsional: aktifkan jika pakai MongoDB ─────────────────────────────────────
-# Hapus tanda # di bawah jika MONGO_URL diisi di .env
+# ── Wajib untuk MongoDB (Security OS + session userbot tersimpan di cloud) ────
+# Hapus tanda # jika MONGO_URL diisi di .env
 # motor==3.3.2
 # pymongo==4.6.1
+
+# ── Catatan requirements untuk fitur Userbot naik Obrolan Suara (VC) ─────────
+#
+# WAJIB (sudah ada di atas):
+#   pyrogram==2.0.106   — client Telegram MTProto (userbot + bot biasa)
+#   TgCrypto            — enkripsi MTProto WAJIB untuk pyrogram (tanpa ini
+#                         pyrogram TIDAK bisa connect ke Telegram)
+#
+# OPSIONAL tapi SANGAT DIREKOMENDASIKAN:
+#   Tidak ada package tambahan yang diperlukan untuk fitur VC.
+#   Semua raw API call (phone.JoinGroupCall, phone.EditGroupCallParticipant,
+#   channels.GetFullChannel) sudah tersedia di pyrogram 2.0.106 built-in.
+#
+# CATATAN PENTING — TgCrypto:
+#   Tanpa TgCrypto, pyrogram menggunakan implementasi Python murni yang
+#   jauh lebih lambat dan TIDAK stabil untuk userbot yang aktif di banyak
+#   grup sekaligus. SELALU pastikan TgCrypto terinstall.
+#   Verifikasi: python -c "from pyrogram.crypto import aes; print('TgCrypto OK')"
+#
+# IZIN USERBOT DI GRUP (bukan package, tapi syarat wajib):
+#   Userbot HARUS menjadi ADMIN grup dengan izin:
+#     ✅ "Kelola Obrolan Video" (manage_video_chats)
+#   Tanpa izin ini, phone.EditGroupCallParticipant akan gagal dengan
+#   CHAT_ADMIN_REQUIRED atau GROUP_CALL_NOT_MODIFIED.

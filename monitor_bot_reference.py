@@ -12,13 +12,13 @@ ARSITEKTUR:
   ┌────────────────────────────────────────────────────────────────────┐
   │  monitor_bot_reference.py (proses ini)                             │
   │                                                                    │
-  │   MonitorInstance(chat_id=grupA, token=tokenA)  ← scan grupA      │
-  │   MonitorInstance(chat_id=grupB, token=tokenB)  ← scan grupB      │
-  │   MonitorInstance(chat_id=grupC, token=tokenC)  ← scan grupC      │
+  │   MonitorInstance(chat_id=grupA, token=tokenA)  ← pantau grupA      │
+  │   MonitorInstance(chat_id=grupB, token=tokenB)  ← pantau grupB      │
+  │   MonitorInstance(chat_id=grupC, token=tokenC)  ← pantau grupC      │
   │                                                                    │
   │   Semua tulis ke collection bio_profiles dengan field chat_id      │
   └──────────────────────────────┬─────────────────────────────────────┘
-                                 │ DB bersama (MONGO_URL / SQLite)
+                                 │ DB bersama (MongoDB)
               ┌──────────────────┴──────────────────┐
               ▼                                     ▼
     ┌──────────────────┐                 ┌──────────────────────┐
@@ -35,8 +35,10 @@ COLLECTION bio_profiles:
     bio        : str,    # isi bio saat dicek
     checked_at : float,  # unix timestamp terakhir dicek
     updated_at : float,  # unix timestamp terakhir berubah status
+    expires_at : datetime, # TTL — dokumen otomatis dihapus MongoDB setelah 5 menit
   }
   Index unik: (chat_id, user_id)
+  Index TTL : expires_at (expireAfterSeconds=0) → MongoDB hapus otomatis
 
 FLOW TOKEN:
   1. Admin aktifkan Security OS di grup → bot utama minta token bot pemantau
@@ -50,8 +52,7 @@ VARIABEL .env:
   MONGO_URL          — HARUS SAMA dengan bot utama (DB bersama)
   MONGO_DB_NAME      — HARUS SAMA dengan bot utama
   CODE_BOT           — HARUS SAMA dengan bot utama
-  SCAN_INTERVAL_MINUTES  — interval scan ulang per grup (default: 30)
-  BIO_RECHECK_SECS       — jeda minimum re-check user sama (default: 600)
+  BIO_TTL_SECS           — TTL data bio di DB sebelum dihapus (default: 300 = 5 menit)
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ import re
 import time
 import asyncio
 from pathlib import Path
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -76,8 +77,14 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 API_ID    = int(os.environ.get("API_ID", 0))
 API_HASH  = os.environ.get("API_HASH", "")
 
-SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", 30))
 BIO_RECHECK_SECS      = int(os.environ.get("BIO_RECHECK_SECS", 600))
+
+# TTL data bio di MongoDB — dokumen dihapus otomatis setelah N detik (default 5 menit)
+BIO_TTL_SECS = int(os.environ.get("BIO_TTL_SECS", 300))
+
+# ── Throttle khusus per skenario ──────────────────────────────────────────────
+VC_JOIN_RECHECK_SECS = int(os.environ.get("VC_JOIN_RECHECK_SECS", 60))
+TYPING_RECHECK_SECS  = int(os.environ.get("TYPING_RECHECK_SECS", 300))
 
 # ── Pola deteksi link di bio ──────────────────────────────────────────────────
 LINK_PATTERN = re.compile(
@@ -96,9 +103,36 @@ bio_col = db["bio_profiles"]   # Collection hasil scan — dibaca bot utama & us
 sec_col = db["security_os"]    # Untuk ambil daftar grup + token
 
 # ── Registry instance aktif ───────────────────────────────────────────────────
-# chat_id → MonitorInstance yang sedang berjalan
 _active_instances: dict[int, "MonitorInstance"] = {}
 _instances_lock = asyncio.Lock()
+
+# ── Flag: TTL index sudah dibuat ──────────────────────────────────────────────
+_ttl_index_created = False
+
+
+async def _ensure_ttl_index() -> None:
+    """
+    Buat TTL index pada field expires_at di bio_profiles.
+    MongoDB akan otomatis hapus dokumen saat expires_at sudah lewat.
+    Dipanggil sekali saat startup — aman dipanggil berulang (idempotent).
+    """
+    global _ttl_index_created
+    if _ttl_index_created:
+        return
+    try:
+        await bio_col.create_index(
+            "expires_at",
+            expireAfterSeconds=0,
+        )
+        print("[Monitor] ✅ TTL index bio_profiles.expires_at siap.")
+        _ttl_index_created = True
+    except Exception as e:
+        print(f"[Monitor] ⚠️  Gagal buat TTL index: {e}")
+
+
+def _make_expires_at() -> datetime:
+    """Return datetime UTC kapan dokumen bio harus dihapus (sekarang + BIO_TTL_SECS)."""
+    return datetime.now(timezone.utc) + timedelta(seconds=BIO_TTL_SECS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -109,7 +143,7 @@ class MonitorInstance:
     """
     Satu bot pemantau untuk satu grup.
     Punya Pyrogram Client sendiri (token unik per grup).
-    Berjalan sebagai background task — scan berkala + event join.
+    Bereaksi terhadap event: pesan masuk, user join, typing, perubahan profil.
     """
 
     def __init__(self, chat_id: int, token: str, bot_id: int):
@@ -119,7 +153,6 @@ class MonitorInstance:
         self._stopped   = False
         self._last_checked: dict[int, float] = {}   # user_id → timestamp
 
-        # Nama session unik per grup agar tidak bentrok antar instance
         session_name = f"monitor_{abs(chat_id)}"
         self.client = Client(
             session_name,
@@ -128,52 +161,41 @@ class MonitorInstance:
             bot_token=token,
         )
 
-        # Task background
-        self._scan_task: Optional[asyncio.Task] = None
         self._raw_handler_registered = False
 
-    # ── Start / Stop ──────────────────────────────────────────────────────────
+        self._last_vc_checked: dict[int, float] = {}
+        self._last_typing_checked: dict[int, float] = {}
 
     async def start(self) -> bool:
-        """Mulai client dan daftarkan handler. Return False jika gagal."""
         try:
             await self.client.start()
-            me = await self.client.get_me()
-            print(
-                f"[Monitor {self.chat_id}] ✅ @{me.username} aktif "
-                f"(bot_id={self.bot_id})"
-            )
+            self._register_handlers()
+            print(f"[Monitor {self.chat_id}] ✅ Bot pemantau aktif.")
+            return True
         except Exception as e:
             print(f"[Monitor {self.chat_id}] ❌ Gagal start: {e}")
             return False
 
-        # Daftarkan event handler (join member)
-        self._register_handlers()
-
-        # Jalankan background scan loop
-        self._scan_task = asyncio.create_task(self._scan_loop())
-
-        return True
-
     async def stop(self) -> None:
-        """Hentikan client dan semua task."""
         self._stopped = True
-        if self._scan_task and not self._scan_task.done():
-            self._scan_task.cancel()
-            try:
-                await self._scan_task
-            except asyncio.CancelledError:
-                pass
         try:
-            await self.client.stop()
+            if self.client.is_connected:
+                await self.client.stop()
         except Exception:
             pass
-        print(f"[Monitor {self.chat_id}] ⏹ Dihentikan.")
-
-    # ── Bio check & simpan ────────────────────────────────────────────────────
+        print(f"[Monitor {self.chat_id}] 🛑 Bot pemantau dihentikan.")
 
     async def _fetch_bio(self, user_id: int) -> str | None:
-        """Ambil bio user via Telegram API. Return None jika gagal."""
+        """
+        Ambil bio user via Telegram API. Return None jika gagal.
+
+        Strategi dua langkah:
+        1. resolve_peer(user_id) → GetFullUser  ← cepat, tapi bisa gagal
+           jika bot belum pernah berinteraksi dengan user ini.
+        2. Fallback: get_chat_member(chat_id, user_id) → resolve peer dari
+           objek member → GetFullUser. Cara ini bekerja selama user adalah
+           anggota grup yang dipantau bot.
+        """
         try:
             peer = await self.client.resolve_peer(user_id)
             full = await self.client.invoke(
@@ -188,6 +210,23 @@ class MonitorInstance:
             await asyncio.sleep(fw.value + 1)
             return None
         except (PeerIdInvalid, KeyError):
+            # ── Fallback: bot belum kenal user → coba via get_chat_member ──
+            try:
+                member = await self.client.get_chat_member(self.chat_id, user_id)
+                if member and member.user:
+                    peer = await self.client.resolve_peer(member.user.id)
+                    full = await self.client.invoke(
+                        raw_fns.users.GetFullUser(id=peer)
+                    )
+                    return getattr(full.full_user, "about", None) or ""
+            except FloodWait as fw2:
+                print(
+                    f"[Monitor {self.chat_id}] FloodWait (fallback) {fw2.value}s "
+                    f"uid={user_id}"
+                )
+                await asyncio.sleep(fw2.value + 1)
+            except Exception:
+                pass
             return None
         except Exception as e:
             print(
@@ -201,6 +240,10 @@ class MonitorInstance:
     ) -> bool | None:
         """
         Cek bio user, simpan ke bio_profiles dengan chat_id grup ini.
+
+        Setiap kali data disimpan/diperbarui, field expires_at diset ulang
+        ke (sekarang + BIO_TTL_SECS). MongoDB TTL index akan hapus dokumen
+        otomatis setelah waktu tersebut.
 
         Return: True (ada link) | False (tidak) | None (gagal fetch)
         Throttle: skip jika belum BIO_RECHECK_SECS sejak cek terakhir,
@@ -224,8 +267,7 @@ class MonitorInstance:
         has_link = bool(LINK_PATTERN.search(bio_text))
         self._last_checked[user_id] = now
 
-        # Baca dokumen lama untuk deteksi perubahan status
-        old_doc     = await bio_col.find_one(
+        old_doc      = await bio_col.find_one(
             {"chat_id": self.chat_id, "user_id": user_id}
         )
         old_has_link = old_doc.get("has_link") if old_doc else None
@@ -234,6 +276,9 @@ class MonitorInstance:
             if old_has_link != has_link
             else (old_doc.get("updated_at", now) if old_doc else now)
         )
+
+        # expires_at selalu diperbarui → TTL 5 menit dari cek terakhir
+        expires_at = _make_expires_at()
 
         await bio_col.update_one(
             {"chat_id": self.chat_id, "user_id": user_id},
@@ -244,6 +289,7 @@ class MonitorInstance:
                 "bio":        bio_text[:500],
                 "checked_at": now,
                 "updated_at": updated_at,
+                "expires_at": expires_at,   # ← TTL MongoDB
             }},
             upsert=True,
         )
@@ -257,71 +303,58 @@ class MonitorInstance:
 
         return has_link
 
-    # ── Scan semua member grup ────────────────────────────────────────────────
-
-    async def _scan_all_members(self) -> int:
+    async def check_and_save_vc(self, user_id: int) -> bool | None:
         """
-        Iterasi semua member non-bot di grup ini.
-        Return jumlah user yang diproses.
+        Paksa re-check bio saat user NAIK KE VOICE CHAT.
+        Cache khusus VC: VC_JOIN_RECHECK_SECS (default 60 detik).
         """
-        count = 0
-        try:
-            # Force resolve peer agar sesi baru tidak PEER_ID_INVALID
-            try:
-                await self.client.get_chat(self.chat_id)
-            except Exception:
-                pass
+        now      = time.time()
+        last_vc  = self._last_vc_checked.get(user_id, 0)
+        last_gen = self._last_checked.get(user_id, 0)
+        last_any = max(last_vc, last_gen)
 
-            async for member in self.client.get_chat_members(self.chat_id):
-                if self._stopped:
-                    break
-                if member.user is None or member.user.is_bot:
-                    continue
-                await self.check_and_save(member.user.id)
-                count += 1
-                await asyncio.sleep(0.35)   # jaga rate limit
-        except FloodWait as fw:
-            print(
-                f"[Monitor {self.chat_id}] FloodWait {fw.value}s "
-                "saat scan member"
+        if now - last_any < VC_JOIN_RECHECK_SECS:
+            doc = await bio_col.find_one(
+                {"chat_id": self.chat_id, "user_id": user_id}
             )
-            await asyncio.sleep(fw.value + 1)
-        except Exception as e:
-            print(f"[Monitor {self.chat_id}] Error scan member: {e}")
-        return count
+            return doc.get("has_link", False) if doc else None
 
-    # ── Background scan loop ──────────────────────────────────────────────────
+        self._last_vc_checked[user_id] = now
+        self._last_checked[user_id]    = now
+        result = await self.check_and_save(user_id, force=True)
+        print(
+            f"[Monitor {self.chat_id}] VC-join uid={user_id} "
+            f"→ bio fresh, has_link={result}"
+        )
+        return result
 
-    async def _scan_loop(self) -> None:
+    async def check_and_save_typing(self, user_id: int) -> bool | None:
         """
-        Scan berkala tiap SCAN_INTERVAL_MINUTES.
-        Langsung scan pertama saat start (delay 10 detik agar client stabil).
-        """
-        await asyncio.sleep(10)
-        while not self._stopped:
-            try:
-                print(
-                    f"[Monitor {self.chat_id}] Mulai scan semua member..."
-                )
-                n = await self._scan_all_members()
-                print(
-                    f"[Monitor {self.chat_id}] ✅ Scan selesai "
-                    f"— {n} user diproses."
-                )
-            except Exception as e:
-                print(f"[Monitor {self.chat_id}] Error di scan loop: {e}")
+        Re-check bio saat user TYPING di grup.
 
-            interval = SCAN_INTERVAL_MINUTES * 60
-            print(
-                f"[Monitor {self.chat_id}] Scan berikutnya "
-                f"dalam {SCAN_INTERVAL_MINUTES} menit."
+        Throttle ketat (TYPING_RECHECK_SECS, default 300 detik = 5 menit).
+        Jika sudah dicek dalam 5 menit → kembalikan data DB.
+        Jika lebih dari 5 menit → fetch fresh dari Telegram API.
+        """
+        now          = time.time()
+        last_typing  = self._last_typing_checked.get(user_id, 0)
+        last_general = self._last_checked.get(user_id, 0)
+        last_any     = max(last_typing, last_general)
+
+        if now - last_any < TYPING_RECHECK_SECS:
+            doc = await bio_col.find_one(
+                {"chat_id": self.chat_id, "user_id": user_id}
             )
-            try:
-                await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                break
+            return doc.get("has_link", False) if doc else None
 
-    # ── Event handlers ────────────────────────────────────────────────────────
+        self._last_typing_checked[user_id] = now
+        self._last_checked[user_id]        = now
+        result = await self.check_and_save(user_id, force=True)
+        print(
+            f"[Monitor {self.chat_id}] Typing uid={user_id} "
+            f"→ bio fresh, has_link={result}"
+        )
+        return result
 
     def _register_handlers(self) -> None:
         """Daftarkan handler Pyrogram ke client instance ini."""
@@ -334,10 +367,9 @@ class MonitorInstance:
             user = message.from_user
             if user is None or user.is_bot:
                 return
-            # force=False → otomatis skip jika sudah dicek < BIO_RECHECK_SECS
             await monitor.check_and_save(user.id, force=False)
 
-        # ── User JOIN grup → langsung cek bio ────────────────────────────────
+        # ── User JOIN grup → cek bio (force) ─────────────────────────────────
         @self.client.on_chat_member_updated()
         async def _on_join(client: Client, upd: ChatMemberUpdated):
             if upd.chat.id != chat_id:
@@ -353,22 +385,29 @@ class MonitorInstance:
             )
             await monitor.check_and_save(user.id, force=True)
 
-        # ── Perubahan profil user → re-check bio ──────────────────────────────
+        # ── Perubahan profil user & TYPING → raw_update handler ──────────────
         @self.client.on_raw_update()
-        async def _on_profile_change(client, update, users, chats):
+        async def _on_profile_or_typing(client, update, users, chats):
             try:
+                # ── Skenario TYPING ──────────────────────────────────────────
+                if isinstance(update, raw_types.UpdateUserTyping):
+                    user_id = getattr(update, "user_id", None)
+                    if user_id and isinstance(user_id, int) and user_id > 0:
+                        # Proses user yang sudah dikenal di grup ini,
+                        # ATAU langsung check_and_save (tidak ada data = fresh check)
+                        await monitor.check_and_save_typing(user_id)
+                    return
+
+                # ── Skenario PERUBAHAN PROFIL ─────────────────────────────────
                 user_id = None
                 if isinstance(update, raw_types.UpdateUserName):
                     user_id = getattr(update, "user_id", None)
                 else:
-                    # UpdateUserPhoto dihapus di pyrogram 2.0.106+
-                    # Gunakan duck-typing berdasarkan nama tipe
                     type_name = type(update).__name__
                     if "Photo" in type_name or "Profile" in type_name:
                         user_id = getattr(update, "user_id", None)
 
                 if user_id and isinstance(user_id, int) and user_id > 0:
-                    # Hanya proses jika user ini dikenal di grup ini
                     known = await bio_col.find_one(
                         {"chat_id": chat_id, "user_id": user_id}
                     )
@@ -394,149 +433,111 @@ async def _load_instances_from_db() -> None:
     Untuk tiap grup yang punya monitor_token → spawn MonitorInstance.
     Dipanggil saat startup.
     """
-    try:
-        docs = await sec_col.find({"enabled": True}).to_list(None)
-    except Exception as e:
-        print(f"[MonitorMgr] Gagal baca security_os dari DB: {e}")
-        return
+    # Pastikan TTL index sudah ada sebelum instance mulai menulis
+    await _ensure_ttl_index()
 
-    for doc in docs:
-        chat_id = doc.get("chat_id")
-        token   = doc.get("monitor_token", "").strip()
+    async for doc in sec_col.find({"monitor_token": {"$exists": True, "$ne": ""}}):
+        chat_id = doc.get("chat_id") or doc.get("_id")
+        token   = doc.get("monitor_token", "")
         bot_id  = doc.get("monitor_bot_id", 0)
-
-        if not chat_id or not token or not bot_id:
+        if not chat_id or not token:
             continue
+        async with _instances_lock:
+            if chat_id not in _active_instances:
+                await _spawn_instance(chat_id, token, bot_id)
 
-        await _spawn_instance(chat_id, token, bot_id)
 
-
-async def _spawn_instance(
-    chat_id: int, token: str, bot_id: int
-) -> bool:
+async def _spawn_instance(chat_id: int, token: str, bot_id: int) -> bool:
     """
-    Spawn MonitorInstance baru untuk chat_id.
-    Jika sudah ada instance untuk chat_id ini, skip (tidak dobel).
-    Return True jika berhasil di-start.
+    Buat dan start MonitorInstance baru.
+    Return True jika berhasil.
     """
-    async with _instances_lock:
-        existing = _active_instances.get(chat_id)
-        if existing and not existing._stopped:
-            # Cek apakah token berubah
-            if existing.token == token:
-                return True   # Sudah jalan, token sama → skip
-            # Token berubah → stop lama, spawn baru
-            print(
-                f"[MonitorMgr] Token berubah untuk grup {chat_id} "
-                "→ restart instance"
-            )
-            await existing.stop()
-
-        instance = MonitorInstance(chat_id, token, bot_id)
-        ok = await instance.start()
-        if ok:
-            _active_instances[chat_id] = instance
-        return ok
+    instance = MonitorInstance(chat_id, token, bot_id)
+    ok = await instance.start()
+    if ok:
+        _active_instances[chat_id] = instance
+    return ok
 
 
 async def _stop_instance(chat_id: int) -> None:
-    """
-    Hentikan MonitorInstance untuk chat_id (jika ada).
-    Dipanggil saat Security OS dinonaktifkan atau token dihapus.
-    """
-    async with _instances_lock:
-        instance = _active_instances.pop(chat_id, None)
+    """Stop dan hapus MonitorInstance untuk grup ini."""
+    instance = _active_instances.pop(chat_id, None)
     if instance:
         await instance.stop()
 
 
-# ── PUBLIC API — dipanggil dari video_call.py / handler UI ───────────────────
-
 async def reload_monitor_instances() -> None:
     """
-    Reload ulang semua instance dari DB.
-    Panggil ini setelah admin menambah/mengubah/menonaktifkan bot pemantau
-    agar perubahan langsung berlaku tanpa restart proses.
-    Fungsi ini safe dipanggil berkali-kali (idempotent).
+    Reload semua instance dari DB.
+    Stop instance yang token-nya sudah dihapus,
+    spawn instance baru untuk grup yang belum punya instance.
     """
-    try:
-        docs = await sec_col.find({}).to_list(None)
-    except Exception as e:
-        print(f"[MonitorMgr] reload: gagal baca DB: {e}")
-        return
+    await _ensure_ttl_index()
 
     db_chat_ids: set[int] = set()
-
-    for doc in docs:
-        chat_id = doc.get("chat_id")
-        enabled = doc.get("enabled", False)
-        token   = doc.get("monitor_token", "").strip()
+    async for doc in sec_col.find({"monitor_token": {"$exists": True, "$ne": ""}}):
+        chat_id = doc.get("chat_id") or doc.get("_id")
+        token   = doc.get("monitor_token", "")
         bot_id  = doc.get("monitor_bot_id", 0)
-
-        if not chat_id:
+        if not chat_id or not token:
             continue
+        db_chat_ids.add(chat_id)
+        async with _instances_lock:
+            if chat_id not in _active_instances:
+                await _spawn_instance(chat_id, token, bot_id)
 
-        if enabled and token and bot_id:
-            db_chat_ids.add(chat_id)
-            await _spawn_instance(chat_id, token, bot_id)
-        else:
-            # Grup dinonaktifkan atau token dihapus → stop instance
-            if chat_id in _active_instances:
-                await _stop_instance(chat_id)
+    # Stop instance yang sudah tidak ada di DB
+    stale = set(_active_instances.keys()) - db_chat_ids
+    for chat_id in stale:
+        async with _instances_lock:
+            await _stop_instance(chat_id)
 
-    # Stop instance untuk chat_id yang sudah tidak ada di DB sama sekali
+
+async def spawn_monitor_for_group(chat_id: int, token: str, bot_id: int) -> bool:
+    """
+    Spawn MonitorInstance untuk grup baru (dipanggil saat admin setup token).
+    Stop instance lama jika ada (token mungkin diganti).
+    """
+    await _ensure_ttl_index()
     async with _instances_lock:
-        stale = [
-            cid for cid in list(_active_instances.keys())
-            if cid not in db_chat_ids
-        ]
-    for cid in stale:
-        await _stop_instance(cid)
-
-    print(
-        f"[MonitorMgr] Reload selesai — "
-        f"{len(db_chat_ids)} grup aktif, "
-        f"{len(_active_instances)} instance berjalan."
-    )
-
-
-async def spawn_monitor_for_group(
-    chat_id: int, token: str, bot_id: int
-) -> bool:
-    """
-    Spawn instance langsung untuk satu grup — dipanggil dari setup_monitor_bot()
-    di video_call.py segera setelah token baru tersimpan ke DB.
-    Tidak perlu reload semua instance.
-    Return True jika berhasil.
-    """
-    return await _spawn_instance(chat_id, token, bot_id)
+        if chat_id in _active_instances:
+            await _stop_instance(chat_id)
+        return await _spawn_instance(chat_id, token, bot_id)
 
 
 async def stop_monitor_for_group(chat_id: int) -> None:
-    """
-    Stop instance untuk satu grup — dipanggil saat Security OS dinonaktifkan.
-    """
-    await _stop_instance(chat_id)
+    """Stop MonitorInstance untuk grup ini (dipanggil saat Security OS dinonaktifkan)."""
+    async with _instances_lock:
+        await _stop_instance(chat_id)
 
 
 def get_active_instance_count() -> int:
-    """Return jumlah instance bot pemantau yang sedang berjalan."""
     return len(_active_instances)
 
 
 def get_active_chat_ids() -> list[int]:
-    """Return daftar chat_id yang sedang dipantau."""
     return list(_active_instances.keys())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUERY BIO — DIPANGGIL OLEH bio.py DAN video_call.py
+# PUBLIC API — dipanggil dari bio.py / video_call.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def force_check_user(chat_id: int, user_id: int) -> bool | None:
     """
     Paksa re-check bio user via MonitorInstance aktif untuk grup ini.
-    Dipanggil oleh bio.py / video_call.py saat data belum ada di DB (None).
+
+    Dipanggil oleh bio.py saat:
+      - Data belum ada di DB (None) → cek fresh
+      - Bot utama terima pesan dari user yang belum dikenal bot pemantau
+
+    Alur:
+      1. Bot utama deteksi pesan dari user X di grup A
+      2. Query bio_profiles {chat_id: A, user_id: X} → None (belum ada)
+      3. Bot utama panggil force_check_user(A, X)
+      4. MonitorInstance grup A fetch bio user X dari Telegram API
+      5. Simpan ke bio_profiles dengan expires_at = sekarang + 5 menit
+      6. Return has_link → bot utama hapus pesan jika True
 
     Return:
       True  → ada link di bio
@@ -553,15 +554,35 @@ async def force_check_user(chat_id: int, user_id: int) -> bool | None:
         return None
 
 
+async def force_check_vc_join(chat_id: int, user_id: int) -> bool | None:
+    """
+    Paksa re-check bio user saat NAIK KE VOICE CHAT.
+    Cache khusus VC (VC_JOIN_RECHECK_SECS = 60 detik default).
+
+    Dipanggil dari video_call.py → saat user join VC.
+    """
+    instance = _active_instances.get(chat_id)
+    if instance is None:
+        return None
+    try:
+        return await instance.check_and_save_vc(user_id)
+    except Exception as e:
+        print(f"[MonitorQuery] force_check_vc_join chat={chat_id} uid={user_id}: {e}")
+        return None
+
+
 async def query_bio(chat_id: int, user_id: int) -> bool | None:
     """
     Baca hasil cek bio dari DB untuk pasangan (chat_id, user_id).
     Data ini ditulis oleh MonitorInstance grup yang bersangkutan.
 
+    Karena data ber-TTL (5 menit), dokumen yang sudah expired otomatis
+    tidak ada di DB → return None → bot utama akan trigger force_check_user.
+
     Return:
       True  → ada link di bio
       False → tidak ada link di bio
-      None  → data belum ada (bot pemantau belum scan user ini) → lewatkan
+      None  → data belum ada atau sudah expired → perlu force_check_user
     """
     try:
         doc = await bio_col.find_one(
@@ -577,18 +598,7 @@ async def query_bio(chat_id: int, user_id: int) -> bool | None:
     if not doc:
         return None
 
-    has_link   = doc.get("has_link", False)
-    checked_at = doc.get("checked_at", 0)
-    data_age   = int(time.time() - checked_at)
-
-    if data_age > SCAN_INTERVAL_MINUTES * 60 * 3:
-        # Data lebih tua dari 3x interval scan — catat saja, tetap pakai
-        print(
-            f"[MonitorQuery] Data bio chat={chat_id} uid={user_id} "
-            f"sudah {data_age//60} menit lama."
-        )
-
-    return has_link
+    return doc.get("has_link", False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -597,45 +607,14 @@ async def query_bio(chat_id: int, user_id: int) -> bool | None:
 
 async def main():
     """
-    Entry point — jalankan manajer bot pemantau sebagai proses mandiri.
-    Semua instance bot pemantau dikelola di sini.
+    Entry point jika monitor_bot_reference.py dijalankan langsung (standalone).
+    Dalam deployment normal, file ini di-import oleh antigcast.py.
     """
-    if not API_ID or not API_HASH:
-        print("❌ API_ID / API_HASH tidak diset di .env")
-        return
-
-    # Init DB (sama polanya dengan bot utama)
-    await _init_backend()
-    print("[MonitorMgr] DB berhasil di-inisialisasi.")
-
-    # Load semua instance dari DB
+    from database import setup_db
+    await setup_db()
     await _load_instances_from_db()
-
-    n = get_active_instance_count()
-    print(
-        f"[MonitorMgr] ✅ {n} instance bot pemantau aktif. "
-        "Tekan Ctrl+C untuk berhenti."
-    )
-
-    if n == 0:
-        print(
-            "[MonitorMgr] Tidak ada bot pemantau aktif saat startup.\n"
-            "  → Aktifkan Security OS di grup via bot utama untuk menambah bot pemantau."
-        )
-
-    # Jaga proses tetap hidup — instance tiap bot punya event loop sendiri
-    try:
-        while True:
-            await asyncio.sleep(60)
-            # Heartbeat: log jumlah instance aktif setiap 1 jam
-    except asyncio.CancelledError:
-        pass
-    finally:
-        # Graceful shutdown semua instance
-        print("[MonitorMgr] Shutdown — menghentikan semua instance...")
-        for instance in list(_active_instances.values()):
-            await instance.stop()
-        print("[MonitorMgr] Semua instance dihentikan.")
+    print(f"[Monitor] {get_active_instance_count()} instance aktif.")
+    await idle()
 
 
 if __name__ == "__main__":
