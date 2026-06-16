@@ -2397,32 +2397,15 @@ async def setup_monitor_bot(
     # ── Langsung spawn instance bot pemantau baru ─────────────────────────────
     # Instance ini akan mulai scan berkala setelah bot pemantau join ke grup.
     # Tidak perlu restart proses — instance jalan dalam proses yang sama.
-    #
-    # PENTING: di-await (bukan fire-and-forget) supaya kalau spawn gagal
-    # (mis. session lama bentrok, token sudah dipakai client lain, dsb)
-    # admin langsung dapat pesan error yang sebenarnya, bukan pesan "berhasil"
-    # yang palsu.
     try:
         from monitor_bot_reference import spawn_monitor_for_group
-        spawn_ok, spawn_err = await spawn_monitor_for_group(chat_id, token, monitor_bot_id)
-        if spawn_ok:
-            print(f"[SecOS] MonitorInstance untuk grup {chat_id} berhasil di-spawn.")
-        else:
-            print(f"[SecOS] Gagal spawn MonitorInstance grup {chat_id}: {spawn_err}")
-            # Rollback supaya admin bisa coba lagi dengan token yang sama
-            # tanpa terblokir "sudah terdaftar" pada percobaan berikutnya.
-            await mon_col.delete_one({"monitor_bot_id": monitor_bot_id})
-            _monitor_username_cache.pop(monitor_bot_id, None)
-            return False, (
-                f"Token valid, tapi bot pemantau gagal dijalankan: <code>{spawn_err}</code>\n"
-                f"Coba lagi, atau buat bot baru via @BotFather jika token ini "
-                f"pernah dipakai/di-revoke."
-            )
+        asyncio.create_task(
+            spawn_monitor_for_group(chat_id, token, monitor_bot_id)
+        )
+        print(f"[SecOS] MonitorInstance untuk grup {chat_id} di-spawn.")
     except Exception as e_spawn:
         print(f"[SecOS] Gagal spawn MonitorInstance: {e_spawn}")
-        await mon_col.delete_one({"monitor_bot_id": monitor_bot_id})
-        _monitor_username_cache.pop(monitor_bot_id, None)
-        return False, f"Gagal menjalankan bot pemantau: {e_spawn}"
+        # Tidak fatal — instance akan di-load ulang saat restart proses
 
     return True, (
         f"Bot @{monitor_uname} berhasil dikonfigurasi.\n"
@@ -2477,9 +2460,7 @@ async def _enable_secos_for_group(chat_id: int) -> None:
         token  = sec_doc.get("monitor_token", "").strip()
         bot_id = sec_doc.get("monitor_bot_id", 0)
         if token and bot_id:
-            ok, err = await spawn_monitor_for_group(chat_id, token, bot_id)
-            if not ok:
-                print(f"[SecOS] Spawn MonitorInstance grup {chat_id} gagal saat enable: {err}")
+            await spawn_monitor_for_group(chat_id, token, bot_id)
         else:
             print(f"[SecOS] Grup {chat_id}: belum ada token monitor — bot pemantau belum dikonfigurasi.")
     except Exception as _e_mon:

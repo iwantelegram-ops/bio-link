@@ -153,24 +153,7 @@ class MonitorInstance:
         self._stopped   = False
         self._last_checked: dict[int, float] = {}   # user_id → timestamp
 
-        # Session name HARUS menyertakan bot_id, bukan cuma chat_id.
-        # Jika hanya berbasis chat_id, ganti token (bot_id baru) di grup yang
-        # sama akan membaca file .session LAMA (kredensial bot lama) dan
-        # Pyrogram gagal start (Unauthorized) karena token baru tidak cocok
-        # dengan auth_key tersimpan. Ini akar masalah "gagal generate" saat
-        # admin mengganti bot pemantau.
-        session_name = f"monitor_{abs(chat_id)}_{bot_id}"
-
-        # Bersihkan file sesi LAMA milik grup ini yang bot_id-nya berbeda
-        # (sisa dari setup token sebelumnya) agar tidak menumpuk di disk.
-        try:
-            workdir = Path(".")
-            for old_session in workdir.glob(f"monitor_{abs(chat_id)}_*.session"):
-                if old_session.stem != session_name:
-                    old_session.unlink(missing_ok=True)
-        except Exception as e_clean:
-            print(f"[Monitor {chat_id}] Gagal bersihkan sesi lama: {e_clean}")
-
+        session_name = f"monitor_{abs(chat_id)}"
         self.client = Client(
             session_name,
             api_id=API_ID,
@@ -183,15 +166,15 @@ class MonitorInstance:
         self._last_vc_checked: dict[int, float] = {}
         self._last_typing_checked: dict[int, float] = {}
 
-    async def start(self) -> tuple[bool, str | None]:
+    async def start(self) -> bool:
         try:
             await self.client.start()
             self._register_handlers()
             print(f"[Monitor {self.chat_id}] ✅ Bot pemantau aktif.")
-            return True, None
+            return True
         except Exception as e:
             print(f"[Monitor {self.chat_id}] ❌ Gagal start: {e}")
-            return False, str(e)
+            return False
 
     async def stop(self) -> None:
         self._stopped = True
@@ -461,21 +444,19 @@ async def _load_instances_from_db() -> None:
             continue
         async with _instances_lock:
             if chat_id not in _active_instances:
-                ok, err = await _spawn_instance(chat_id, token, bot_id)
-                if not ok:
-                    print(f"[Monitor] Gagal load instance grup {chat_id} dari DB: {err}")
+                await _spawn_instance(chat_id, token, bot_id)
 
 
-async def _spawn_instance(chat_id: int, token: str, bot_id: int) -> tuple[bool, str | None]:
+async def _spawn_instance(chat_id: int, token: str, bot_id: int) -> bool:
     """
     Buat dan start MonitorInstance baru.
-    Return (True, None) jika berhasil, (False, alasan) jika gagal.
+    Return True jika berhasil.
     """
     instance = MonitorInstance(chat_id, token, bot_id)
-    ok, err = await instance.start()
+    ok = await instance.start()
     if ok:
         _active_instances[chat_id] = instance
-    return ok, err
+    return ok
 
 
 async def _stop_instance(chat_id: int) -> None:
@@ -503,9 +484,7 @@ async def reload_monitor_instances() -> None:
         db_chat_ids.add(chat_id)
         async with _instances_lock:
             if chat_id not in _active_instances:
-                ok, err = await _spawn_instance(chat_id, token, bot_id)
-                if not ok:
-                    print(f"[Monitor] Gagal reload instance grup {chat_id}: {err}")
+                await _spawn_instance(chat_id, token, bot_id)
 
     # Stop instance yang sudah tidak ada di DB
     stale = set(_active_instances.keys()) - db_chat_ids
@@ -514,11 +493,10 @@ async def reload_monitor_instances() -> None:
             await _stop_instance(chat_id)
 
 
-async def spawn_monitor_for_group(chat_id: int, token: str, bot_id: int) -> tuple[bool, str | None]:
+async def spawn_monitor_for_group(chat_id: int, token: str, bot_id: int) -> bool:
     """
     Spawn MonitorInstance untuk grup baru (dipanggil saat admin setup token).
     Stop instance lama jika ada (token mungkin diganti).
-    Return (True, None) jika berhasil, (False, alasan) jika gagal.
     """
     await _ensure_ttl_index()
     async with _instances_lock:
