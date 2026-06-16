@@ -154,17 +154,6 @@ class MonitorInstance:
         self._last_checked: dict[int, float] = {}   # user_id → timestamp
 
         session_name = f"monitor_{abs(chat_id)}"
-
-        # Hapus file session lama jika ada (token mungkin baru diganti untuk
-        # grup ini) — supaya tidak bentrok dengan kredensial bot pemantau
-        # sebelumnya. Tanpa ini, generate/ganti token bisa gagal start.
-        try:
-            session_file = Path(f"{session_name}.session")
-            if session_file.exists():
-                session_file.unlink()
-        except Exception:
-            pass
-
         self.client = Client(
             session_name,
             api_id=API_ID,
